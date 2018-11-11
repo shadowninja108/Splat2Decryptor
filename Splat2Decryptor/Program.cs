@@ -3,14 +3,18 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Net;
+using System.Security.Cryptography;
 using System.Text;
 using System.Windows;
 using Microsoft.WindowsAPICodePack.Dialogs;
 
 namespace Splat2Decryptor
 {
-    class Program
+    public class Program
     {
+        private static string KeyMaterialString = "e413645fa69cafe34a76192843e48cbd691d1f9fba87e8a23d40e02ce13b0d534d10301576f31bc70b763a60cf07149cfca50e2a6b3955b98f26ca84a5844a8aeca7318f8d7dba406af4e45c4806fa4d7b736d51cceaaf0e96f657bb3a8af9b175d51b9bddc1ed475677260f33c41ddbc1ee30b46c4df1b24a25cf7cb6019794";
+        private static string MagicNumbers = "nisasyst";
+
         [STAThread]
         static void Main(string[] args)
         {
@@ -18,149 +22,129 @@ namespace Splat2Decryptor
             dialog.IsFolderPicker = true;
             if (dialog.ShowDialog() == CommonFileDialogResult.Ok)
             {
-                if (!File.Exists("./nisasyst.py"))
-                {
-                    Console.WriteLine("Requesting SciresM's decryption script...");
-                    new WebClient().DownloadFile("https://gist.githubusercontent.com/SciresM/dba70bc2ee7eca11e1bd777ecb58ff16/raw/5bbca5d062d3d5fdb2b8507fe6d323b318be2d20/nisasyst.py", "nisasyst.py");
-                }
-                if (!IsPythonInstalled())
-                {
-                    MessageBox.Show("You don't have Python installed! Go install the latest Python 2.");
-                    Environment.Exit(1);
-                }
-                Console.WriteLine("Installing pycrypto");
-                InstallPyCrypto();
                 string path = dialog.FileName;
-                Directory.CreateDirectory($"./dec/");
-                string result;
-                foreach (string file in FindFilesRecursively(path))
+                DirectoryInfo rootenc = new DirectoryInfo(dialog.FileName);
+                DirectoryInfo rootdec = new DirectoryInfo("./dec");
+                foreach (FileInfo enc in FindFilesRecursively(rootenc))
                 {
-                    string relativefile = file.Replace(path, "").Replace('\\', '/').Substring(1);
-                    string output = $"./dec/{relativefile}";
-                    Directory.CreateDirectory(new FileInfo(output).Directory.FullName);
-                    result = RunPythonCommand($"nisasyst.py \"{file}\" \"{relativefile}\" \"{output}\"");
-                    if (result.Contains("Error: Input appears not to be an encrypted Splatoon 2 archive!"))
-                        Console.WriteLine($"Skipping {relativefile}...");
-                    else if (result.Contains("Traceback"))
-                    {
-                        File.WriteAllText("./error.txt", result);
-                        MessageBox.Show("Unknown error occured! Saved log to error.txt");
-                        Environment.Exit(1);
-                    } else
+                    if (enc.Name == "Mush.release.pack") // fucking dumbasses
+                        continue;
+
+                    string relativefile = enc.FullName.Replace(path, "").Replace('\\', '/').Substring(1);
+                    FileInfo dec = new FileInfo(Path.Combine(rootdec.FullName, relativefile));
+                    if (DecryptNisasyst(enc, relativefile, dec))
                         Console.WriteLine($"Decrypted {relativefile}");
+                    else
+                        Console.WriteLine($"Skipping {relativefile}");
                 }
             }
         }
 
-        static string RunPythonCommand(string command)
+        public static bool DecryptNisasyst(FileInfo input, string path, FileInfo output)
         {
-            string result;
-            if (!CanUsePythonLauncher())
+            using (FileStream fileStream = input.OpenRead())
+            using (StreamReader streamReader = new StreamReader(fileStream))
             {
-                if (GetPythonVersion().ToCharArray()[0] != '2')
-                    MessageBox.Show("You don't have Python 2 installed! This probably won't work...");
-                result = RunCommand("python " + command);
-            }
-            else
-            {
-                result = RunCommand("py -2 " + command);
-                if (result.Contains("Requested Python version (2) not installed"))
+                // Test the file length
+                if (fileStream.Length <= 8)
                 {
-                    MessageBox.Show("You don't have Python 2 installed! Go install it.");
-                    Environment.Exit(1);
+                    // This can't be a valid file
+                    return false;
                 }
-            }
-            return result;
-        }
 
-        static string GetPythonVersion()
-        {
-            string result;
-            result = RunCommand("py --version");
-            if(result.Contains("not recognized"))
-                result = RunCommand("python --version");
-            if (result.Contains("not recognized"))
-                return null;
-            return result.Replace("Python ", "");
-        }
+                // Seek to the magic numbers
+                fileStream.Seek(-8, SeekOrigin.End);
 
-        static bool CanUsePythonLauncher()
-        {
-            string result;
-            result = RunCommand("py --version");
-            if (result.Contains("not recognized"))
-                return false;
-            return true;
-        }
-
-        static bool IsPythonInstalled()
-        {
-            return GetPythonVersion() != null;
-        }
-
-        static void InstallPyCrypto()
-        {
-            string result;
-            if (!CanUsePythonLauncher())
-            {
-                if(GetPythonVersion().ToCharArray()[0] == '3')
-                    MessageBox.Show("You only have Python 3 installed! This probably won't work...");
-                result = RunCommand("pip install pycrypto");
-            } else
-            {
-                result = RunCommand("py -2 -m pip install pycrypto");
-                if(result.Contains("Requested Python version (2) not installed"))
+                // Verify the magic numbers
+                if (streamReader.ReadToEnd() != MagicNumbers)
                 {
-                    MessageBox.Show("You don't have Python 2 installed! Go install it.");
-                    Environment.Exit(1);
+                    // This isn't a valid file
+                    return false;
+                }
+
+                // Generate a CRC32 over the game path
+                Crc32 crc32 = new Crc32();
+                uint seed = crc32.Get(Encoding.ASCII.GetBytes(path));
+
+                // Create a new SeadRandom instance using the seed
+                SeadRandom seadRandom = new SeadRandom(seed);
+
+                // Create the encryption key and IV
+                byte[] encryptionKey = CreateSequence(seadRandom);
+                byte[] iv = CreateSequence(seadRandom);
+
+                using (MemoryStream memoryStream = new MemoryStream())
+                using (AesManaged cryptor = new AesManaged())
+                {
+                    cryptor.Mode = CipherMode.CBC;
+                    cryptor.Padding = PaddingMode.PKCS7;
+                    cryptor.KeySize = 128;
+                    cryptor.BlockSize = 128;
+
+                    using (CryptoStream cryptoStream = new CryptoStream(memoryStream, cryptor.CreateDecryptor(encryptionKey, iv), CryptoStreamMode.Write))
+                    {
+                        // Seek to the beginning of the file
+                        fileStream.Seek(0, SeekOrigin.Begin);
+
+                        // Copy the encrypted data
+                        CopyStream(fileStream, cryptoStream, (int)fileStream.Length - 8);
+                    }
+
+                    // Write out the new file
+                    byte[] outputBytes = memoryStream.ToArray();
+                    output.Directory.Create();
+                    using (FileStream outputStream = output.Create())
+                        outputStream.Write(outputBytes, 0, outputBytes.Length);
+
+                    return true;
                 }
             }
-            if (result.Contains("error: Microsoft Visual C++ 9.0 is required."))
-            {
-                MessageBox.Show("You are missing Microsoft Visual C++ 9.0.\nAfter you press ok, the link to install will be put into your clipboard.\nRun this program again when you are done.");
-                Clipboard.SetText("https://www.microsoft.com/en-us/download/details.aspx?id=44266");
-                Environment.Exit(1);
-            }
-            if (result.Contains("error"))
-            {
-                File.WriteAllText("./error.txt", result);
-                MessageBox.Show("Unknown error occured! Saved log to error.txt");
-                Environment.Exit(1);
-            }
-
         }
 
-        static List<string> FindFilesRecursively(string path)
+        private static byte[] CreateSequence(SeadRandom random)
+        {
+            // Create byte array
+            byte[] sequence = new byte[16];
+
+            // Create each byte
+            for (int i = 0; i < sequence.Length; i++)
+            {
+                // Create empty byte string
+                string byteString = "";// "0x";
+
+                // Get characters from key material
+                byteString += KeyMaterialString[(int)(random.GetUInt32() >> 24)];
+                byteString += KeyMaterialString[(int)(random.GetUInt32() >> 24)];
+
+                // Parse the resulting byte
+                sequence[i] = Convert.ToByte(byteString, 16);
+            }
+
+            // Return the sequence
+            return sequence;
+        }
+
+        // https://stackoverflow.com/questions/13021866/any-way-to-use-stream-copyto-to-copy-only-certain-number-of-bytes
+        private static void CopyStream(Stream input, Stream output, int bytes)
+        {
+            byte[] buffer = new byte[32768];
+            int read;
+            while (bytes > 0 &&
+                   (read = input.Read(buffer, 0, Math.Min(buffer.Length, bytes))) > 0)
+            {
+                output.Write(buffer, 0, read);
+                bytes -= read;
+            }
+        }
+
+
+        public static List<FileInfo> FindFilesRecursively(DirectoryInfo info)
         {
             // much easier than Java
-            List<string> list = new List<string>();
-            foreach (string file in Directory.EnumerateFiles(path, "*.*", SearchOption.AllDirectories))        
+            List<FileInfo> list = new List<FileInfo>();
+            foreach (FileInfo file in info.EnumerateFiles("*.*", SearchOption.AllDirectories))        
                 list.Add(file);
             return list;
-        }
-
-        static string RunCommand(string command)
-        {
-            ProcessStartInfo info = new ProcessStartInfo();
-            info.FileName = "cmd.exe";
-            info.Arguments = "/C " + command;
-            info.UseShellExecute = false;
-            info.RedirectStandardInput = true;
-            info.RedirectStandardOutput = true;
-            info.RedirectStandardError = true;
-            info.CreateNoWindow = true;
-            
-
-            using (Process process = Process.Start(info))
-            {
-                StringBuilder builder = new StringBuilder();
-                process.OutputDataReceived += (s, a) => builder.Append(a.Data);
-                process.ErrorDataReceived += (s, a) => builder.Append(a.Data);
-                process.BeginOutputReadLine();
-                process.BeginErrorReadLine();
-                process.WaitForExit();
-                return builder.ToString();
-            }
         }
     }
 }
