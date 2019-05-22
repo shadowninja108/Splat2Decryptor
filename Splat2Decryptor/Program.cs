@@ -30,7 +30,9 @@ namespace Splat2Decryptor
                     if (enc.Name == "Mush.release.pack") // fucking dumbasses
                         continue;
 
-                    string relativefile = enc.FullName.Replace(path, "").Replace('\\', '/').Substring(1);
+                    string relativefile = enc.FullName.Replace(path, "").Replace('\\', '/');
+                    if (relativefile.StartsWith("/"))
+                        relativefile = relativefile.Substring(1);
                     FileInfo dec = new FileInfo(Path.Combine(rootdec.FullName, relativefile));
                     if (DecryptNisasyst(enc, relativefile, dec))
                         Console.WriteLine($"Decrypted {relativefile}");
